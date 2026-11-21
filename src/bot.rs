@@ -33,6 +33,14 @@ pub struct Params {
     pub new_pref: bool,
     /// avoid engaging enemies unless they engage us
     pub passive: bool,
+    /// shoot back at drones that attack us (any mode, any hp)
+    pub npc_fix: bool,
+    /// value-based upgrade choice instead of the fixed order
+    pub upg_v2: bool,
+    /// with no reachable cover and a single attacker, fight instead of running in the open
+    pub stand_no_cover: bool,
+    /// turn to face unseen attackers that hit our rear
+    pub face_unseen: bool,
     /// upgrade priority (ids)
     pub upgrade_order: Vec<&'static str>,
 }
@@ -53,6 +61,10 @@ impl Default for Params {
             farm_hp: 0.85,
             new_pref: true,
             passive: false,
+            npc_fix: true,
+            upg_v2: true,
+            stand_no_cover: true,
+            face_unseen: true,
             upgrade_order: vec![
                 "armor",
                 "plating",
@@ -126,6 +138,13 @@ pub struct Bot {
     stuck_t: f64,
     unstick_until: f64,
     last_dmg_t: f64,
+    /// drones that shot us recently: (id or -1, bearing, time)
+    npc_hurt: Vec<(i32, f64, f64)>,
+    upg_taken: Vec<String>,
+    cover_check: (f64, bool),
+    /// hits from mechs we cannot see: (id, bearing, time, rear, amount)
+    unseen: Vec<(i32, f64, f64, bool, f64)>,
+    last_offer: i64,
     last_shot_t: f64,
     dmg_window: Vec<(f64, f64)>,
     pub mode: Mode,
@@ -202,6 +221,11 @@ impl Bot {
             stuck_t: 0.0,
             unstick_until: -1.0,
             last_dmg_t: -100.0,
+            npc_hurt: Vec::new(),
+            upg_taken: Vec::new(),
+            cover_check: (-100.0, true),
+            unseen: Vec::new(),
+            last_offer: -1,
             last_shot_t: -100.0,
             dmg_window: Vec::new(),
             mode: Mode::Hold,
@@ -278,10 +302,21 @@ impl Bot {
             }
         }
         for e in &o.events {
+            if e.typ == "damaged" && e.weapon == "npc" {
+                self.npc_hurt.push((e.by.unwrap_or(-1), e.bearing.unwrap_or(0.0), o.t));
+            }
             if e.typ == "damaged" {
                 self.last_dmg_t = o.t;
                 self.dmg_window.push((o.t, e.amount));
+                if e.weapon != "zone" && e.by.is_none() {
+                    if let Some(b) = e.bearing {
+                        self.last_sound = Some((b, 60.0, o.t));
+                    }
+                }
                 if let Some(by) = e.by {
+                    if e.weapon != "npc" && !o.mechs.iter().any(|m| m.id == by) {
+                        self.unseen.push((by, e.bearing.unwrap_or(0.0), o.t, e.rear, e.amount));
+                    }
                     if let Some(tr) = self.tracks.iter_mut().find(|t| t.id == by) {
                         tr.dmg_to_me += e.amount;
                         tr.last_hit_me_t = o.t;
@@ -305,6 +340,8 @@ impl Bot {
         // death sounds: can't attribute; drop very stale tracks
         self.tracks.retain(|t| o.t - t.seen_t < 25.0);
         self.dmg_window.retain(|d| o.t - d.0 < 4.0);
+        self.npc_hurt.retain(|d| o.t - d.2 < 4.0);
+        self.unseen.retain(|d| o.t - d.2 < 3.0);
         self.blacklist.retain(|b| b.1 > o.t);
         for s in &o.sounds {
             if s.kind == "gun" || s.kind == "laser" || s.kind == "lightning" || s.kind == "mortar" || s.kind == "step" || s.kind == "boost" || s.kind == "laser_charge" {
@@ -365,7 +402,53 @@ impl Bot {
         }
     }
 
-    fn choose_upgrade(&self, of: &Offer) -> usize {
+    fn choose_upgrade(&mut self, of: &Offer) -> usize {
+        if self.p.upg_v2 {
+            // rough % gain in effective HP or overall DPS per stack
+            let val = |id: &str, n: usize| -> f64 {
+                let v = match id {
+                    "plating" => 15.0,
+                    "gun_mag" => [12.0, 6.0][n.min(1)],
+                    "nanites" => 10.0,
+                    "armor" => 9.0 + n as f64 * 0.8,
+                    "laser_damage" => 8.0,
+                    "gun_damage" => 7.0,
+                    "lightning_efficiency" => 6.0,
+                    "lightning_range" => 6.0,
+                    "laser_charge" => 5.0,
+                    "gun_velocity" => 5.0,
+                    "gun_rate" => 4.0,
+                    "lightning_chain" => 4.0,
+                    "servos" => 3.0,
+                    "sensors" => 2.5,
+                    "gyros" => 2.0,
+                    "reactor" => 2.0,
+                    "mortar_reload" => 2.0,
+                    "capacitor" => 1.5,
+                    "jets" => 1.5,
+                    "mortar_splash" => 1.5,
+                    "mortar_velocity" => 1.0,
+                    "laser_pierce" => 1.0,
+                    _ => 0.5,
+                };
+                v
+            };
+            let mut best = (f64::MIN, 0usize);
+            for (i, c) in of.choices.iter().enumerate() {
+                let n = self.upg_taken.iter().filter(|x| *x == c).count();
+                let v = val(c.as_str(), n);
+                if v > best.0 {
+                    best = (v, i);
+                }
+            }
+            if self.last_offer != of.id {
+                self.last_offer = of.id;
+                if let Some(c) = of.choices.get(best.1) {
+                    self.upg_taken.push(c.clone());
+                }
+            }
+            return best.1;
+        }
         let mut best = (usize::MAX, 0usize);
         for (i, c) in of.choices.iter().enumerate() {
             let r = self.p.upgrade_order.iter().position(|u| u == c).unwrap_or(100);
@@ -543,6 +626,17 @@ impl Bot {
         best.map(|b| (b.0, b.1))
     }
 
+    /// True when retreating is pointless: no hidden spot nearby and a lone attacker we can shoot back at.
+    fn no_cover_stand(&mut self, me: &SelfObs, t: f64, threats: &[(V3, f64)], zc: [f64; 2], zr: f64, lone_target: bool) -> bool {
+        if !self.p.stand_no_cover || !lone_target {
+            return false;
+        }
+        if t - self.cover_check.0 > 1.0 {
+            self.cover_check = (t, self.find_cover(me, threats, zc, zr).is_some());
+        }
+        !self.cover_check.1
+    }
+
     pub fn act(&mut self, o: &Obs) -> Action {
         let t = o.t;
         let me = &o.me;
@@ -613,6 +707,25 @@ impl Bot {
             });
         }
 
+        // ---------------- hostile drones: shooting us, or close enough to start
+        let mut hostile_npc: Option<(V3, V3, f64)> = None; // pos, vel, dist
+        for n in o.mechs.iter().filter(|m| !m.is_mech) {
+            let d = d3(&n.pos, &me.pos);
+            let by_id = self.npc_hurt.iter().any(|h| h.0 == n.id);
+            let by_bearing = self.npc_hurt.iter().any(|h| h.0 < 0 && wrap(h.1 - yaw_to(&me.pos, &n.pos)).abs() < 0.3) && d < 100.0;
+            let close = d < self.cfg.npc_aggro + 3.0;
+            if !self.p.npc_fix || !(by_id || by_bearing || close) {
+                continue;
+            }
+            let cp = [n.pos[0], n.pos[1], n.pos[2] + self.cfg.npc_height * 0.5];
+            if !self.world.los(my_muz, cp) {
+                continue;
+            }
+            if hostile_npc.map_or(true, |h| d < h.2) {
+                hostile_npc = Some((cp, n.vel, d));
+            }
+        }
+
         // ---------------- target selection
         let mut target: Option<usize> = None;
         let mut best_score = f64::MAX;
@@ -669,7 +782,9 @@ impl Bot {
 
         // ---------------- engagement decision
         let engaged: Vec<usize> = ens.iter().enumerate().filter(|(_, e)| e.sees_me && e.d < 260.0).map(|(i, _)| i).collect();
-        let incoming: f64 = engaged.iter().map(|&i| ens[i].dps).sum::<f64>().max(1.0);
+        let npc_dps = if self.p.npc_fix && !self.npc_hurt.is_empty() { self.cfg.npc_damage / self.cfg.npc_cooldown.max(0.1) } else { 0.0 };
+        let unseen_dps: f64 = if self.p.face_unseen { self.unseen.iter().map(|u| u.4).sum::<f64>() / 3.0 } else { 0.0 };
+        let incoming: f64 = (engaged.iter().map(|&i| ens[i].dps).sum::<f64>() + npc_dps + unseen_dps).max(1.0);
         let my_ttl = me.hp / incoming;
         let mut fight = false;
         if let Some(ti) = target {
@@ -714,6 +829,21 @@ impl Bot {
         }
         let recent_dmg: f64 = self.dmg_window.iter().map(|d| d.1).sum();
 
+        // no hidden spot to run to from a lone attacker: stand and fight
+        let stand = !engaged.is_empty()
+            && (!fight || hp_frac < self.p.retreat_hp)
+            && self.no_cover_stand(
+                me,
+                t,
+                &engaged.iter().map(|&i| (ens[i].pos, ens[i].scale)).collect::<Vec<_>>(),
+                zc_soon,
+                zr_soon,
+                engaged.len() == 1 && target.map_or(false, |ti| engaged.contains(&ti)),
+            );
+        if stand {
+            fight = true;
+        }
+
         // ---------------- movement
         let mut mv = [0.0, 0.0];
         let mut boost = false;
@@ -740,7 +870,7 @@ impl Bot {
             };
             mv = self.nav_to(me, t, gx, gy);
             boost = !me.in_zone || late;
-        } else if !engaged.is_empty() && (!fight || hp_frac < self.p.retreat_hp) {
+        } else if !engaged.is_empty() && (!fight || hp_frac < self.p.retreat_hp) && !stand {
             mode = Mode::Retreat;
             let threats: Vec<(V3, f64)> = engaged.iter().map(|&i| (ens[i].pos, ens[i].scale)).collect();
             let need_new = match self.cover {
@@ -830,6 +960,14 @@ impl Bot {
                     let m = self.nav_to(me, t, e.pos[0], e.pos[1]);
                     dx = m[0];
                     dy = m[1];
+                }
+            }
+            // keep away from a drone that is shooting us (it gives up beyond ~90 m / its leash)
+            if let Some((np, _, nd)) = hostile_npc {
+                if self.p.npc_fix && nd < 70.0 && !self.npc_hurt.is_empty() {
+                    let (ax, ay) = norm2(me.pos[0] - np[0], me.pos[1] - np[1]);
+                    dx += ax * 0.7;
+                    dy += ay * 0.7;
                 }
             }
             // stay in zone: blend toward hold if near edge
@@ -1024,6 +1162,13 @@ impl Bot {
                     th = Some((e.d, e.pos));
                 }
             }
+            if th.is_none() {
+                if let Some((np, _, nd)) = hostile_npc {
+                    if !self.npc_hurt.is_empty() {
+                        th = Some((nd, np));
+                    }
+                }
+            }
             if th.is_none() && t - self.last_dmg_t < 1.0 {
                 if let Some((b, _, _)) = self.last_sound {
                     th = Some((80.0, [me.pos[0] + b.cos() * 80.0, me.pos[1] + b.sin() * 80.0, me.pos[2]]));
@@ -1196,7 +1341,54 @@ impl Bot {
         } else {
             // no target: shoot crates/npcs if looting & safe, else scan
             let mut shot = false;
-            if mode == Mode::Loot || mode == Mode::Hold {
+            if let Some((cp, vel, d)) = hostile_npc {
+                let gun = me.weapons.iter().flatten().find(|w| w.kind == WK::Gun);
+                let mut ap = cp;
+                if let Some(g) = gun {
+                    if let Some(ti) = intercept(my_muz, cp, vel, g.stats.speed) {
+                        ap = add(cp, mul(vel, ti));
+                    }
+                }
+                let (ay, apt) = angles(sub(ap, my_muz));
+                aim = [ay, apt];
+                let tol = (1.4 / d.max(1.0)).atan() + 0.01;
+                let yaw_err = wrap(ay - me.aim[0]).abs();
+                let aligned = yaw_err < tol && (apt - me.aim[1]).abs() < tol * 1.5;
+                for (si, w) in me.weapons.iter().enumerate() {
+                    if let Some(w) = w {
+                        match w.kind {
+                            WK::Gun => {
+                                if aligned && w.ammo > 0.0 && w.reload <= 0.0 && d < w.stats.range {
+                                    fire[si] = true;
+                                }
+                                if w.ammo <= 0.0 && w.reload <= 0.0 {
+                                    a.reload = true;
+                                }
+                            }
+                            WK::Lightning => {
+                                if d < w.stats.range * 0.95 && yaw_err < (w.stats.cone_deg * 0.45).to_radians() && me.energy >= w.stats.energy {
+                                    fire[si] = true;
+                                }
+                            }
+                            WK::Laser => {
+                                if d < w.stats.range * 0.95 {
+                                    if w.charge <= 0.0 {
+                                        fire[si] = w.cooldown <= 0.05 && yaw_err < 0.35;
+                                    } else if w.charge + 0.05 < w.stats.charge {
+                                        fire[si] = true;
+                                    } else {
+                                        let lt = (1.2 / d.max(1.0)).atan() + 0.006;
+                                        fire[si] = !(yaw_err < lt && (apt - me.aim[1]).abs() < lt * 1.5);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                shot = true;
+            }
+            if !shot && (mode == Mode::Loot || mode == Mode::Hold) {
                 let gun = me.weapons.iter().flatten().find(|w| w.kind == WK::Gun);
                 let mut best: Option<(V3, V3, f64)> = None;
                 for c in &o.crates {
@@ -1292,6 +1484,16 @@ impl Bot {
                     if laser_charge > 0.0 {
                         fire[s] = true;
                     }
+                }
+            }
+        }
+        // shot in the back by someone we cannot see: face them (front armor, and they become visible)
+        if self.p.face_unseen {
+            if let Some(u) = self.unseen.iter().rev().find(|u| t - u.2 < 0.9 && u.3) {
+                let finishing = target.map_or(false, |ti| ens[ti].hp < 250.0 && ens[ti].d < 120.0);
+                if !finishing && laser_charge <= 0.0 {
+                    aim = [u.1, 0.0];
+                    fire = [false, false];
                 }
             }
         }

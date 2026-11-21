@@ -59,6 +59,8 @@ pub struct House {
     strafe_t: f64,
     aim_err: (f64, f64),
     aim_err_t: f64,
+    laser_err: f64,
+    last_hurt_t: f64,
     react_t: f64,
     target_id: i32,
     roam: Option<(f64, f64)>,
@@ -82,6 +84,8 @@ impl House {
             strafe_t: 0.0,
             aim_err: (0.0, 0.0),
             aim_err_t: 0.0,
+            laser_err: 0.0,
+            last_hurt_t: -100.0,
             react_t: 0.0,
             target_id: -1,
             roam: None,
@@ -91,8 +95,8 @@ impl House {
         let d: f64 = match self.skill {
             Skill::Easy => 3.5,
             Skill::Medium => 2.0,
-            Skill::Hard => 1.0,
-            Skill::Expert => 0.45,
+            Skill::Hard => 1.3,
+            Skill::Expert => 0.8,
         };
         d.to_radians()
     }
@@ -162,7 +166,14 @@ impl Agent for House {
         // enemies: any non-squad mech
         let enemies: Vec<&Actor> = o.mechs.iter().filter(|m| m.is_mech && !self.squad_ids.contains(&m.id)).collect();
         let mut target: Option<(i32, V3, V3, f64)> = None;
-        for e in &enemies {
+        for e in &o.events {
+            if e.typ == "damaged" {
+                self.last_hurt_t = o.t;
+            }
+        }
+        // HOUSE_PASSIVE: squad bots that are not hunting leave the prey alone unless it hurts them
+        let ignore = !hunting && *HOUSE_PASSIVE && o.t - self.last_hurt_t > 6.0 && !self.squad_ids.is_empty() && self.squad_ids.len() > 1;
+        for e in enemies.iter().filter(|_| !ignore) {
             let d = d3(&e.pos, &me.pos);
             if target.map_or(true, |t| d < t.3) {
                 target = Some((e.id, e.pos, e.vel, d));
@@ -220,6 +231,8 @@ impl Agent for House {
                 let s = self.sigma();
                 self.aim_err = (self.rng.gauss() * s, self.rng.gauss() * s * 0.6);
                 self.aim_err_t = o.t + 0.3;
+                // real house lasers hit only ~15-28% (live feeds): extra error while a laser is charging
+                self.laser_err = self.rng.gauss() * LASER_ERR;
             }
             let tc = [tp[0], tp[1], tp[2] + 4.5];
             let lead_f = match self.skill {
@@ -231,7 +244,8 @@ impl Agent for House {
             let ti = intercept(muz, tc, tv, gun_speed).unwrap_or(d / gun_speed);
             let ap = add(tc, mul(tv, ti * lead_f));
             let (ay, apt) = angles(sub(ap, muz));
-            let aim = [ay + self.aim_err.0, apt + self.aim_err.1];
+            let charging = me.weapons.iter().flatten().any(|w| w.kind == WK::Laser && w.charge > 0.0);
+            let aim = [ay + self.aim_err.0 + if charging { self.laser_err } else { 0.0 }, apt + self.aim_err.1];
             a.aim = Some(aim);
             let visible = enemies.iter().any(|e| e.id == tid);
             let los = self.world.los(muz, tc);
@@ -462,6 +476,9 @@ impl Agent for Brawler {
         a
     }
 }
+
+const LASER_ERR: f64 = 0.04;
+static HOUSE_PASSIVE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("HOUSE_PASSIVE").is_ok());
 
 pub fn mk_bot(cfg: &Config, world: &Arc<World>, nav: &Nav, seed: u64, id: i32, p: Params, tag: &str) -> Box<dyn Agent> {
     Box::new(BotAgent { bot: Bot::new(cfg.clone(), world.clone(), nav.clone(), seed, id, p), tag: tag.to_string() })

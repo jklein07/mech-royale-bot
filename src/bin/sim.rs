@@ -38,6 +38,10 @@ fn parse_params(s: &str) -> Params {
             "farm_hp" => p.farm_hp = f,
             "new_pref" => p.new_pref = f != 0.0,
             "passive" => p.passive = f != 0.0,
+            "npc_fix" => p.npc_fix = f != 0.0,
+            "upg_v2" => p.upg_v2 = f != 0.0,
+            "stand_no_cover" => p.stand_no_cover = f != 0.0,
+            "face_unseen" => p.face_unseen = f != 0.0,
             "w_mortar" => p.wpref[1] = f,
             "w_laser" => p.wpref[2] = f,
             "w_lightning" => p.wpref[3] = f,
@@ -118,7 +122,11 @@ fn run_match(
         let squad_ids: Vec<i32> = (0..n as i32).filter(|&i| i as usize != me).collect();
         for i in 0..n {
             if i == me {
-                agents.push(mk_bot(cfg, world, nav, seed ^ 0xabc, i as i32, params.clone(), "me"));
+                if std::env::var("ME").map_or(false, |v| v == "starter") {
+                    agents.push(Box::new(Starter { reach: cfg.pickup_radius }));
+                } else {
+                    agents.push(mk_bot(cfg, world, nav, seed ^ 0xabc, i as i32, params.clone(), "me"));
+                }
             } else {
                 squad[i] = true;
                 rank[i] = k as i32;
@@ -225,6 +233,33 @@ fn run_match(
     (Res { acc: (m.gun_shots, m.gun_hits, sim.mechs.iter().enumerate().filter(|(i, _)| *i != me).map(|(_, x)| x.gun_shots).sum(), sim.mechs.iter().enumerate().filter(|(i, _)| *i != me).map(|(_, x)| x.gun_hits).sum()), place: place[me], kills: m.kills, dmg: m.dmg_dealt, survive_t: surv }, others)
 }
 
+/// 16-mech free-for-all among our own bot: half the slots play params A, half params B.
+/// Returns mean (16 - place) for A and B in this match.
+fn run_selfplay(cfg: &Config, world: &Arc<World>, nav: &Arc<Nav>, seed: u64, pa: &Params, pb: &Params) -> (f64, f64) {
+    let n = cfg.mechs;
+    let mut rng = mechbot::geom::Rng(seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493) | 1);
+    let mut grp: Vec<usize> = (0..n).map(|i| i % 2).collect();
+    for i in (1..n).rev() {
+        let j = (rng.next() % (i as u64 + 1)) as usize;
+        grp.swap(i, j);
+    }
+    let mut agents: Vec<Box<dyn Agent>> = Vec::new();
+    for i in 0..n {
+        let p = if grp[i] == 0 { pa.clone() } else { pb.clone() };
+        agents.push(mk_bot(cfg, world, nav, seed.wrapping_add(i as u64 * 7919), i as i32, p, if grp[i] == 0 { "A" } else { "B" }));
+    }
+    let mc = MatchCfg { seed, squad: vec![false; n], max_t: cfg.duration_s };
+    let mut sim = Sim::new(cfg.clone(), world.clone(), nav.clone(), &mc);
+    let place = sim.run(&mut agents);
+    let mut s = [0.0, 0.0];
+    let mut c = [0.0, 0.0];
+    for i in 0..n {
+        s[grp[i]] += 16.0 - place[i] as f64;
+        c[grp[i]] += 1.0;
+    }
+    (s[0] / c[0], s[1] / c[1])
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let get = |k: &str, d: &str| -> String {
@@ -243,13 +278,56 @@ fn main() {
     let seed0: u64 = get("--seed", "1").parse().unwrap();
     let pa = parse_params(&get("--a", ""));
     let pb_s = get("--b", "");
-    let pb = if pb_s.is_empty() { None } else { Some(parse_params(&pb_s)) };
+    let pb: Option<Params> = if pb_s.is_empty() { None } else { Some(parse_params(&pb_s)) };
     let mix = get("--mix", "bot:5,starter:3,brawler:3,house:4");
     let verbose = args.iter().any(|a| a == "-v");
     let hello = json::parse(&std::fs::read_to_string(&hello_path).expect("hello")).expect("hello json");
     let cfg = Config::from(hello.get("config"));
     let world = Arc::new(World::load(&map).expect("map"));
     let nav = Arc::new(Nav::build(&world, 10.0));
+    if mode == "selfplay" {
+        let pb = pb.clone().unwrap_or_default();
+        let res = Arc::new(Mutex::new(Vec::new()));
+        let next = Arc::new(Mutex::new(0usize));
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                let (res, next) = (res.clone(), next.clone());
+                let (cfg, world, nav, pa, pb) = (&cfg, &world, &nav, &pa, &pb);
+                sc.spawn(move || loop {
+                    let k = {
+                        let mut g = next.lock().unwrap();
+                        let k = *g;
+                        *g += 1;
+                        k
+                    };
+                    if k >= n {
+                        break;
+                    }
+                    let r = run_selfplay(cfg, world, nav, seed0 + k as u64, pa, pb);
+                    if verbose {
+                        eprintln!("seed {} A {:.2} B {:.2}", seed0 + k as u64, r.0, r.1);
+                    }
+                    res.lock().unwrap().push(r);
+                });
+            }
+        });
+        let rs = res.lock().unwrap();
+        let m = rs.len() as f64;
+        let d: Vec<f64> = rs.iter().map(|r| r.0 - r.1).collect();
+        let md = d.iter().sum::<f64>() / m;
+        let sd = (d.iter().map(|x| (x - md).powi(2)).sum::<f64>() / (m - 1.0).max(1.0)).sqrt() / m.sqrt();
+        println!(
+            "[selfplay] n={} A {:.2}  B {:.2}  A-B {:+.2} ± {:.2}  ({:.1}s)",
+            rs.len(),
+            rs.iter().map(|r| r.0).sum::<f64>() / m,
+            rs.iter().map(|r| r.1).sum::<f64>() / m,
+            md,
+            sd,
+            t0.elapsed().as_secs_f64()
+        );
+        return;
+    }
     let variants: Vec<(String, Params)> = match pb {
         Some(pb) => vec![("A".into(), pa), ("B".into(), pb)],
         None => vec![("A".into(), pa)],

@@ -27,6 +27,14 @@ python3 check/check.py --map-dir /arena -- docker run --rm -i --network none --c
 
 (`check/check.py` and `arena/` come from the organizers' `mechfight-kit`, which is not included here.)
 
+## Local tools
+
+| Path | What |
+| --- | --- |
+| `src/sim.rs`, `src/agents.rs`, `src/bin/sim.rs` | Approximate local match simulator with stand-in house bots (practice, free-for-all and 1v1 modes). |
+| `tools/live.py` | Runs the bot in a private room on the public play server (empty seats are server bots) and logs the match. |
+| `tools/feed.py` | Summarizes a recorded spectator feed (accuracy, damage, deaths per mech). |
+
 ## Credits
 
 Written from scratch for this event against the organizers' `protocol.md`. The stdin/stdout

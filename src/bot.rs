@@ -109,6 +109,8 @@ pub struct Bot {
     path_t: f64,
     strafe: f64,
     strafe_until: f64,
+    jink: f64,
+    jink_until: f64,
     stuck_t: f64,
     unstick_until: f64,
     last_dmg_t: f64,
@@ -118,6 +120,10 @@ pub struct Bot {
     hold: Option<(f64, f64)>,
     hold_key: f64,
     blacklist: Vec<(i64, f64)>,
+    loot_track: Option<(i64, f64, f64)>,
+    target_id: Option<i32>,
+    last_fight: bool,
+    decide_lock: f64,
     last_t: f64,
     scan_yaw: f64,
     last_sound: Option<(f64, f64, f64)>, // bearing, dist estimate, time
@@ -176,6 +182,8 @@ impl Bot {
             path_t: -100.0,
             strafe: 1.0,
             strafe_until: 0.0,
+            jink: 1.0,
+            jink_until: 0.0,
             stuck_t: 0.0,
             unstick_until: -1.0,
             last_dmg_t: -100.0,
@@ -185,6 +193,10 @@ impl Bot {
             hold: None,
             hold_key: -1.0,
             blacklist: Vec::new(),
+            loot_track: None,
+            target_id: None,
+            last_fight: false,
+            decide_lock: 0.0,
             last_t: 0.0,
             scan_yaw: 0.0,
             last_sound: None,
@@ -492,6 +504,7 @@ impl Bot {
             pos: V3,
             vel: V3,
             hp: f64,
+            max_hp: f64,
             d: f64,
             los: bool,
             sees_me: bool,
@@ -526,6 +539,7 @@ impl Bot {
                 pos,
                 vel: tr.vel,
                 hp: tr.hp,
+                max_hp: tr.max_hp.max(1.0),
                 d,
                 los,
                 sees_me,
@@ -560,18 +574,26 @@ impl Bot {
             if e.d > max_range {
                 continue;
             }
-            let mut s = e.d / 60.0 + e.hp / 400.0;
+            // expected seconds to kill + slew time, with stickiness
+            let dps = self.my_dps(me, e.d).max(20.0);
+            let slew = wrap(yaw_to(&me.pos, &e.pos) - me.aim[0]).abs() / me.stats.turn_rate.max(1.0);
+            let mut s = e.hp / dps + slew * 2.0 + e.d / 400.0;
             if e.sees_me {
-                s -= 1.0;
+                s -= 0.8;
             }
             if !e.facing {
-                s -= 0.5;
+                s -= 0.3;
+            }
+            if Some(e.id) == self.target_id {
+                s -= 1.2;
             }
             if s < best_score {
                 best_score = s;
                 target = Some(i);
             }
         }
+
+        self.target_id = target.map(|i| ens[i].id);
 
         // ---------------- zone
         let (zc_now, zr_now) = self.zone_at(&o.zone, t);
@@ -594,12 +616,40 @@ impl Bot {
             let e = &ens[ti];
             let my_dps = self.my_dps(me, e.d).max(1.0);
             let ttk = e.hp / my_dps;
-            fight = ttk < my_ttl * self.p.fight_ratio || (engaged.is_empty() && !self.p.passive);
-            if self.p.passive && !e.sees_me && e.hp > 500.0 {
-                fight = false;
+            let advantage = ttk < my_ttl * self.p.fight_ratio;
+            let their_ttk = me.hp / e.dps.max(1.0);
+            let initiate = !self.p.passive
+                || e.sees_me
+                || e.hp < 0.55 * e.max_hp
+                || (!e.facing && e.d < 140.0)
+                || ttk * 2.0 < their_ttk;
+            fight = advantage && initiate;
+            if engaged.is_empty() && !self.p.passive {
+                fight = true;
             }
             if hp_frac < self.p.retreat_hp && !engaged.is_empty() && ttk > 1.5 {
                 fight = false;
+            }
+            // cornered at short range: fight
+            if !fight && e.sees_me && e.d < 22.0 {
+                fight = true;
+            }
+            // finish low targets
+            if e.hp < 260.0 && e.d < 160.0 && hp_frac > 0.2 {
+                fight = true;
+            }
+            // hysteresis
+            if t < self.decide_lock {
+                if self.last_fight && hp_frac > self.p.retreat_hp - 0.05 {
+                    fight = true;
+                }
+                if !self.last_fight && e.hp > 260.0 {
+                    fight = false;
+                }
+            }
+            if fight != self.last_fight {
+                self.last_fight = fight;
+                self.decide_lock = t + if fight { 1.5 } else { 2.0 };
             }
         }
         let recent_dmg: f64 = self.dmg_window.iter().map(|d| d.1).sum();
@@ -715,7 +765,7 @@ impl Bot {
             }
         } else {
             // loot or hold
-            let mut goal: Option<(f64, f64, f64)> = None; // x,y,score
+            let mut goal: Option<(f64, f64, f64, i64)> = None; // x,y,score,id
             let want = |k: WK, me: &SelfObs, p: &Params| -> f64 {
                 if me.weapons.iter().flatten().any(|w| w.kind == k) {
                     return 0.0;
@@ -758,10 +808,13 @@ impl Bot {
                     }
                     let s = v * 3.0 / (d + 15.0);
                     if goal.map_or(true, |g| s > g.2) {
-                        goal = Some((pk.pos[0], pk.pos[1], s));
+                        goal = Some((pk.pos[0], pk.pos[1], s, pk.id));
                     }
                 }
                 for c in &o.cubes {
+                    if self.blacklist.iter().any(|b| b.0 == c.id) {
+                        continue;
+                    }
                     let d = d3(&c.pos, &me.pos);
                     if d > self.p.loot_range {
                         continue;
@@ -778,12 +831,28 @@ impl Bot {
                     }
                     let s = 2.0 / (d + 15.0);
                     if goal.map_or(true, |g| s > g.2) {
-                        goal = Some((c.pos[0], c.pos[1], s));
+                        goal = Some((c.pos[0], c.pos[1], s, c.id));
                     }
                 }
             }
-            if let Some((gx, gy, _)) = goal {
+            if let Some((gx, gy, _, gid)) = goal {
                 mode = Mode::Loot;
+                // progress tracking: blacklist goals we can't get closer to
+                let dnow = ((gx - me.pos[0]).powi(2) + (gy - me.pos[1]).powi(2)).sqrt();
+                match self.loot_track {
+                    Some((id, _, best)) if id == gid => {
+                        if dnow < best - 2.0 {
+                            self.loot_track = Some((gid, t, dnow));
+                        }
+                    }
+                    _ => self.loot_track = Some((gid, t, dnow)),
+                }
+                if let Some((_, since, _)) = self.loot_track {
+                    if t - since > 5.0 {
+                        self.blacklist.push((gid, t + 60.0));
+                        self.loot_track = None;
+                    }
+                }
                 mv = self.nav_to(me, t, gx, gy);
             } else {
                 // hold position near hold point, drift slowly
@@ -791,6 +860,43 @@ impl Bot {
                 if dh > 6.0 {
                     mv = self.nav_to(me, t, hold.0, hold.1);
                     boost = dh > 150.0 && me.energy > 70.0 && in_zone_ok;
+                }
+            }
+        }
+
+        // evasive jinking whenever someone is shooting at / can see us (fight mode strafes on its own)
+        if mode != Mode::Fight {
+            let mut th: Option<(f64, V3)> = None;
+            for e in &ens {
+                if e.sees_me && e.d < 240.0 && e.fresh && th.map_or(true, |x| e.d < x.0) {
+                    th = Some((e.d, e.pos));
+                }
+            }
+            if th.is_none() && t - self.last_dmg_t < 1.0 {
+                if let Some((b, _, _)) = self.last_sound {
+                    th = Some((80.0, [me.pos[0] + b.cos() * 80.0, me.pos[1] + b.sin() * 80.0, me.pos[2]]));
+                }
+            }
+            if let Some((_, tp)) = th {
+                if t > self.jink_until {
+                    self.jink = if self.rng.f() < 0.5 { 1.0 } else { -1.0 };
+                    self.jink_until = t + self.rng.range(0.3, 0.9);
+                }
+                let (rx, ry) = norm2(tp[0] - me.pos[0], tp[1] - me.pos[1]);
+                let (px, py) = (-ry * self.jink, rx * self.jink);
+                let base_l = (mv[0] * mv[0] + mv[1] * mv[1]).sqrt();
+                let w = if base_l > 0.3 { 0.75 } else { 1.0 };
+                let cand = [mv[0] + px * w, mv[1] + py * w];
+                if self.walk_dir_ok(me, cand[0], cand[1], 4.0) {
+                    let (nx, ny) = norm2(cand[0], cand[1]);
+                    mv = [nx, ny];
+                } else {
+                    let cand2 = [mv[0] - px * w, mv[1] - py * w];
+                    if self.walk_dir_ok(me, cand2[0], cand2[1], 4.0) {
+                        self.jink = -self.jink;
+                        let (nx, ny) = norm2(cand2[0], cand2[1]);
+                        mv = [nx, ny];
+                    }
                 }
             }
         }
@@ -990,8 +1096,8 @@ impl Bot {
                         }
                     }
                     shot = true;
-                    // approach to loot the cube
-                    if mode == Mode::Hold && d > 25.0 {
+                    // approach to loot the cube / get in good range
+                    if mode == Mode::Hold && d > 32.0 {
                         a.mv = self.nav_to(me, t, cp[0], cp[1]);
                     }
                 }

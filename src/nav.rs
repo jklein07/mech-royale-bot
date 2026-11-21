@@ -6,6 +6,7 @@ use std::collections::BinaryHeap;
 
 pub const CS: f64 = 2.0;
 
+#[derive(Clone)]
 pub struct Nav {
     pub w: usize,
     pub h: usize,

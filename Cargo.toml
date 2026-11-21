@@ -1,0 +1,19 @@
+[package]
+name = "mechbot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A mechfight/1 bot for the Builders Mech Royale track"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "unwind"
+
+[[bin]]
+name = "bot"
+path = "src/main.rs"

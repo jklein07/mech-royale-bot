@@ -33,6 +33,10 @@ fn parse_params(s: &str) -> Params {
             "loot_range" => p.loot_range = f,
             "hunt_npcs" => p.hunt_npcs = f != 0.0,
             "drop_range" => p.drop_range = f,
+            "silent" => p.silent = f != 0.0,
+            "reload_cover" => p.reload_cover = f != 0.0,
+            "farm_hp" => p.farm_hp = f,
+            "new_pref" => p.new_pref = f != 0.0,
             "passive" => p.passive = f != 0.0,
             "w_mortar" => p.wpref[1] = f,
             "w_laser" => p.wpref[2] = f,
@@ -168,7 +172,9 @@ fn run_match(
     if mode == "practice" || mode == "duel" {
         sim.intel = Some(intel.clone());
         sim.rank = rank;
-        sim.all_hunt_t = 0.0;
+        if mode == "duel" {
+            sim.all_hunt_t = 0.0;
+        }
         sim.prey_known = mode == "duel";
     }
     if mode == "duel" {

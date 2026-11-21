@@ -26,6 +26,11 @@ pub struct Params {
     pub hunt_npcs: bool,
     /// max distance to go for a supply drop
     pub drop_range: f64,
+    /// walk below step-sound speed when not hurried
+    pub silent: bool,
+    pub reload_cover: bool,
+    pub farm_hp: f64,
+    pub new_pref: bool,
     /// avoid engaging enemies unless they engage us
     pub passive: bool,
     /// upgrade priority (ids)
@@ -43,6 +48,10 @@ impl Default for Params {
             loot_range: 140.0,
             hunt_npcs: true,
             drop_range: 200.0,
+            silent: true,
+            reload_cover: true,
+            farm_hp: 0.85,
+            new_pref: true,
             passive: false,
             upgrade_order: vec![
                 "armor",
@@ -771,10 +780,31 @@ impl Bot {
             // preferred range
             let has = |k: WK| me.weapons.iter().flatten().any(|w| w.kind == k);
             let they_light = e.weapons.contains(&WK::Lightning);
-            let pref = if has(WK::Lightning) && (!they_light || hp_frac > 0.5) {
-                24.0
+            let they_laser = e.weapons.contains(&WK::Laser);
+            let pref = if !self.p.new_pref {
+                if has(WK::Lightning) && (!they_light || hp_frac > 0.5) {
+                    24.0
+                } else if they_light {
+                    75.0
+                } else if has(WK::Laser) {
+                    110.0
+                } else if has(WK::Mortar) {
+                    90.0
+                } else {
+                    65.0
+                }
+            } else if has(WK::Lightning) && !they_light && hp_frac > 0.35 {
+                26.0
+            } else if has(WK::Lightning) && they_light {
+                if has(WK::Laser) && !they_laser {
+                    100.0
+                } else if me.hp > e.hp * 1.3 {
+                    26.0
+                } else {
+                    70.0
+                }
             } else if they_light {
-                75.0
+                72.0
             } else if has(WK::Laser) {
                 110.0
             } else if has(WK::Mortar) {
@@ -811,6 +841,18 @@ impl Bot {
             let (nx, ny) = norm2(dx, dy);
             mv = [nx, ny];
             boost = me.energy > 60.0 && e.d > pref + 40.0;
+            // reloading with nothing else to shoot: duck behind cover
+            let gun_reload = me.weapons.iter().flatten().find(|w| w.kind == WK::Gun).map_or(0.0, |w| w.reload);
+            let other_ready = me.weapons.iter().flatten().any(|w| w.kind != WK::Gun && w.cooldown < 0.4 && (w.kind != WK::Lightning || e.d < w.stats.range));
+            if self.p.reload_cover && gun_reload > 0.9 && !other_ready && e.hp > 250.0 && e.sees_me {
+                let threats: Vec<(V3, f64)> = engaged.iter().map(|&i| (ens[i].pos, ens[i].scale)).collect();
+                if let Some((cx, cy)) = self.find_cover(me, &threats, zc_soon, zr_soon) {
+                    if ((cx - me.pos[0]).powi(2) + (cy - me.pos[1]).powi(2)).sqrt() < 30.0 {
+                        mv = self.nav_to(me, t, cx, cy);
+                        boost = me.energy > 30.0;
+                    }
+                }
+            }
             if e.d < 60.0 && me.grounded && self.rng.f() < 0.08 && me.energy > 40.0 {
                 jump = true;
             }
@@ -962,6 +1004,14 @@ impl Bot {
                 if dh > 6.0 {
                     mv = self.nav_to(me, t, hold.0, hold.1);
                     boost = dh > 150.0 && me.energy > 70.0 && in_zone_ok;
+                    // no hurry: walk below the step-sound speed
+                    let dz_c = d2(&me.pos, &o.zone.next_center);
+                    let slack = (o.zone.shrink_end - t) - (dz_c - o.zone.next_radius * 0.6).max(0.0) / (me.stats.walk_speed * 0.4);
+                    if self.p.silent && slack > 20.0 && dh < 200.0 {
+                        let f = (self.cfg.step_speed * 0.9) / me.stats.walk_speed;
+                        mv = [mv[0] * f, mv[1] * f];
+                        boost = false;
+                    }
                 }
             }
         }
@@ -1151,14 +1201,14 @@ impl Bot {
                 let mut best: Option<(V3, V3, f64)> = None;
                 for c in &o.crates {
                     let d = d3(&c.pos, &me.pos);
-                    if d < 70.0 && engaged.is_empty() {
+                    if d < 70.0 && engaged.is_empty() && hp_frac > self.p.farm_hp {
                         let cp = [c.pos[0], c.pos[1], c.pos[2] + 1.2];
                         if self.world.los(my_muz, cp) && best.map_or(true, |b| d < b.2) {
                             best = Some((cp, [0.0; 3], d));
                         }
                     }
                 }
-                if self.p.hunt_npcs && hp_frac > 0.5 {
+                if self.p.hunt_npcs && hp_frac > self.p.farm_hp {
                     for n in o.mechs.iter().filter(|m| !m.is_mech) {
                         let d = d3(&n.pos, &me.pos);
                         if d < 90.0 && engaged.is_empty() {

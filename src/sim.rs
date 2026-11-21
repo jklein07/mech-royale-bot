@@ -67,6 +67,8 @@ pub struct MechS {
     pub short_until: f64,
     pub step_acc: f64,
     pub dmg_dealt: f64,
+    pub gun_shots: u32,
+    pub gun_hits: u32,
     pub last_fire: [bool; 2],
 }
 
@@ -177,6 +179,8 @@ pub struct Sim {
     /// weakness rank per slot (lower hunts first)
     pub rank: Vec<i32>,
     pub all_hunt_t: f64,
+    /// hunters always know the prey position (duel tests)
+    pub prey_known: bool,
 }
 
 fn sstat(st: &MStats, path: &str) -> Option<f64> {
@@ -215,6 +219,7 @@ impl Sim {
             intel: None,
             rank: vec![0; n],
             all_hunt_t: 240.0,
+            prey_known: false,
             cfg,
             world,
             nav,
@@ -280,6 +285,8 @@ impl Sim {
                 short_until: -1.0,
                 step_acc: 0.0,
                 dmg_dealt: 0.0,
+                gun_shots: 0,
+                gun_hits: 0,
                 last_fire: [false, false],
             });
         }
@@ -1138,6 +1145,7 @@ impl Sim {
                         self.sound("reload", base, i as i32);
                     } else if fire && w.cooldown <= 0.0 && w.ammo > 0.0 && w.equip <= 0.0 {
                         w.ammo -= 1.0;
+                        self.mechs[i].gun_shots += 1;
                         w.cooldown += ws.cooldown;
                         if w.cooldown < 0.0 {
                             w.cooldown = 0.0;
@@ -1387,7 +1395,12 @@ impl Sim {
                 if t <= hit_wall_t {
                     let at = add(a, mul(sub(b, a), t));
                     match p.kind {
-                        0 => self.damage(p.owner, kk, j, p.dmg, "gun", a, None),
+                        0 => {
+                            if kk == 0 && p.owner >= 0 {
+                                self.mechs[p.owner as usize].gun_hits += 1;
+                            }
+                            self.damage(p.owner, kk, j, p.dmg, "gun", a, None)
+                        }
                         1 => self.explode(&p, at, Some((kk, j))),
                         _ => {
                             if kk == 0 {
@@ -1820,7 +1833,7 @@ impl Sim {
                     it.prey = None;
                     let prey = (0..n).find(|&j| !self.squad[j] && self.mechs[j].alive);
                     if let Some(p) = prey {
-                        if self.t - self.squad_seen[p] <= self.cfg.memory_s {
+                        if self.prey_known || self.t - self.squad_seen[p] <= self.cfg.memory_s {
                             it.prey = Some((p as i32, self.mechs[p].pos, self.mechs[p].vel));
                         }
                     }

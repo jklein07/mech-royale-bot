@@ -24,6 +24,8 @@ pub struct Params {
     pub loot_range: f64,
     /// whether to hunt NPC drones
     pub hunt_npcs: bool,
+    /// max distance to go for a supply drop
+    pub drop_range: f64,
     /// avoid engaging enemies unless they engage us
     pub passive: bool,
     /// upgrade priority (ids)
@@ -40,6 +42,7 @@ impl Default for Params {
             wpref: [1.0, 1.2, 3.0, 2.8],
             loot_range: 140.0,
             hunt_npcs: true,
+            drop_range: 200.0,
             passive: false,
             upgrade_order: vec![
                 "armor",
@@ -122,6 +125,9 @@ pub struct Bot {
     blacklist: Vec<(i64, f64)>,
     loot_track: Option<(i64, f64, f64)>,
     target_id: Option<i32>,
+    mem_pk: Vec<(i64, WK, V3)>,
+    mem_cube: Vec<(i64, V3)>,
+    mem_crate: Vec<(i64, V3)>,
     last_fight: bool,
     decide_lock: f64,
     last_t: f64,
@@ -195,6 +201,9 @@ impl Bot {
             blacklist: Vec::new(),
             loot_track: None,
             target_id: None,
+            mem_pk: Vec::new(),
+            mem_cube: Vec::new(),
+            mem_crate: Vec::new(),
             last_fight: false,
             decide_lock: 0.0,
             last_t: 0.0,
@@ -302,6 +311,47 @@ impl Bot {
                 if better {
                     self.last_sound = Some((s.bearing, d, o.t));
                 }
+            }
+        }
+    }
+
+    fn upd_memory(&mut self, o: &Obs) {
+        let me = &o.me;
+        let eye = [me.pos[0], me.pos[1], me.pos[2] + me.stats.eye_height.max(8.0)];
+        for p in &o.pickups {
+            match self.mem_pk.iter_mut().find(|x| x.0 == p.id) {
+                Some(x) => x.2 = p.pos,
+                None => self.mem_pk.push((p.id, p.kind, p.pos)),
+            }
+        }
+        for c in &o.cubes {
+            if !self.mem_cube.iter().any(|x| x.0 == c.id) {
+                self.mem_cube.push((c.id, c.pos));
+            }
+        }
+        for c in &o.crates {
+            if !self.mem_crate.iter().any(|x| x.0 == c.id) {
+                self.mem_crate.push((c.id, c.pos));
+            }
+        }
+        let w = &self.world;
+        let gone = |id: i64, pos: &V3, visible: bool| -> bool {
+            if visible {
+                return false;
+            }
+            let d = d2(pos, &me.pos);
+            d < 38.0 && w.los(eye, [pos[0], pos[1], pos[2] + 0.6])
+        };
+        let pk_ids: Vec<i64> = o.pickups.iter().map(|p| p.id).collect();
+        self.mem_pk.retain(|x| !gone(x.0, &x.2, pk_ids.contains(&x.0)));
+        let cu_ids: Vec<i64> = o.cubes.iter().map(|p| p.id).collect();
+        self.mem_cube.retain(|x| !gone(x.0, &x.1, cu_ids.contains(&x.0)));
+        let cr_ids: Vec<i64> = o.crates.iter().map(|p| p.id).collect();
+        self.mem_crate.retain(|x| !gone(x.0, &x.1, cr_ids.contains(&x.0)));
+        for e in &o.events {
+            if e.typ == "took" {
+                let id = e.id;
+                self.mem_pk.retain(|x| x.0 != id);
             }
         }
     }
@@ -490,6 +540,7 @@ impl Bot {
         let sc = self.scale(me);
         self.id = me.id;
         self.upd_tracks(o);
+        self.upd_memory(o);
         let mut a = Action::default();
         if let Some(of) = &o.offer {
             a.pick = Some(self.choose_upgrade(of));
@@ -783,7 +834,8 @@ impl Bot {
             };
             let safe = engaged.is_empty() && recent_dmg < 1.0;
             if safe || (engaged.is_empty() && hp_frac > 0.6) {
-                for pk in &o.pickups {
+                let mem_pk: Vec<Pickup> = self.mem_pk.iter().map(|x| Pickup { id: x.0, kind: x.1, pos: x.2 }).collect();
+                for pk in &mem_pk {
                     if self.blacklist.iter().any(|b| b.0 == pk.id) {
                         continue;
                     }
@@ -811,7 +863,8 @@ impl Bot {
                         goal = Some((pk.pos[0], pk.pos[1], s, pk.id));
                     }
                 }
-                for c in &o.cubes {
+                let mem_cube: Vec<Item> = self.mem_cube.iter().map(|x| Item { id: x.0, pos: x.1, hp: 0.0 }).collect();
+                for c in &mem_cube {
                     if self.blacklist.iter().any(|b| b.0 == c.id) {
                         continue;
                     }
@@ -835,8 +888,57 @@ impl Bot {
                     }
                 }
             }
+            if safe || (engaged.is_empty() && hp_frac > 0.6) {
+                let mem_cr: Vec<(i64, V3)> = self.mem_crate.clone();
+                for (cid, cp) in &mem_cr {
+                    if self.blacklist.iter().any(|b| b.0 == *cid) {
+                        continue;
+                    }
+                    let d = d3(cp, &me.pos);
+                    if d < 30.0 || d > 110.0 {
+                        continue;
+                    }
+                    if (cp[2] - me.pos[2]).abs() > 6.0 {
+                        continue; // roof crate
+                    }
+                    if d2(cp, &zc_soon) > zr_soon - 10.0 {
+                        continue;
+                    }
+                    let s = 1.2 / (d + 25.0);
+                    if goal.map_or(true, |g| s > g.2) {
+                        goal = Some((cp[0], cp[1], s, *cid));
+                    }
+                }
+            }
+            // supply drops: full heal + 3 cubes if we can hold the ring alone
+            if engaged.is_empty() {
+                for dr in &o.drops {
+                    let d = d2(&dr.pos, &me.pos);
+                    let eta = d / me.stats.walk_speed;
+                    if d > self.p.drop_range || dr.lands_in > eta + 20.0 {
+                        continue;
+                    }
+                    if let Some(h) = dr.holder {
+                        if h != me.id {
+                            continue;
+                        }
+                    }
+                    let contested = ens.iter().any(|e| d2(&e.pos, &dr.pos) < 70.0 && t - 0.0 >= 0.0);
+                    if contested {
+                        continue;
+                    }
+                    if d2(&dr.pos, &zc_soon) > zr_soon - 5.0 {
+                        continue;
+                    }
+                    let s = 6.0 / (d + 20.0);
+                    if goal.map_or(true, |g| s > g.2) {
+                        goal = Some((dr.pos[0], dr.pos[1], s, dr.id));
+                    }
+                }
+            }
             if let Some((gx, gy, _, gid)) = goal {
                 mode = Mode::Loot;
+                let is_drop = gid >= 20000;
                 // progress tracking: blacklist goals we can't get closer to
                 let dnow = ((gx - me.pos[0]).powi(2) + (gy - me.pos[1]).powi(2)).sqrt();
                 match self.loot_track {
@@ -848,7 +950,7 @@ impl Bot {
                     _ => self.loot_track = Some((gid, t, dnow)),
                 }
                 if let Some((_, since, _)) = self.loot_track {
-                    if t - since > 5.0 {
+                    if t - since > 5.0 && !(is_drop && dnow < 6.0) {
                         self.blacklist.push((gid, t + 60.0));
                         self.loot_track = None;
                     }

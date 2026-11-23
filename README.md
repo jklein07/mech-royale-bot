@@ -5,6 +5,8 @@ battle royale and speaks the `mechfight/1` JSON-lines protocol on stdin/stdout.
 
 Team: *fortnite pirate token*.
 
+**Result:** placed **206th of 410 teams** in the final (-27.58 placement points).
+
 ## Layout
 
 | Path | What |
